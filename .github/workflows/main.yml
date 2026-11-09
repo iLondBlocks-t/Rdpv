@@ -1,4 +1,4 @@
-name: Android RDP Cloud
+name: Android Cloud RDP
 
 on:
   workflow_dispatch:
@@ -9,6 +9,18 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # 1. Install Java 17
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 2. Setup Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 3. Install Linux Desktop and RDP
       - name: Install Desktop and RDP Server
         run: |
           sudo apt-get update
@@ -22,10 +34,8 @@ jobs:
             iptables \
             netcat-openbsd
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android 64-bit Emulator
+      # 4. Install Android 64-bit Emulator
+      - name: Install Android Emulator
         run: |
           sdkmanager --install \
             "platform-tools" \
@@ -36,26 +46,28 @@ jobs:
           echo "no" | avdmanager create avd \
             --force \
             --name CloudPhone \
+            --device pixel_7_pro \
             --package "system-images;android-35;google_apis;x86_64"
 
+      # 5. Connect Tailscale
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
+      # 6. Configure RDP Account
       - name: Configure RDP Account
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
-            echo "RDP password must contain at least 12 characters"
+          if [ -z "$RDP_PASSWORD" ] || [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "RDP_PASSWORD must contain at least 12 characters"
             exit 1
           fi
 
           USER_NAME=$(whoami)
 
           echo "$USER_NAME:$RDP_PASSWORD" | sudo chpasswd
-
           sudo usermod -aG ssl-cert "$USER_NAME"
 
           mkdir -p "$HOME/.config/autostart"
@@ -67,16 +79,16 @@ jobs:
 
           chmod +x "$HOME/.xsession"
 
+      # 7. Configure Android Auto Start
       - name: Configure Android Auto Start
         run: |
-          mkdir -p "$HOME/.config/autostart"
-
-          cat > "$HOME/start-android.sh" <<EOF
+          cat > "$HOME/start-android.sh" <<'EOF'
           #!/bin/bash
-          export ANDROID_HOME="$ANDROID_HOME"
-          export PATH="\$ANDROID_HOME/platform-tools:\$ANDROID_HOME/emulator:\$PATH"
 
-          "\$ANDROID_HOME/emulator/emulator" \
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          "$ANDROID_HOME/emulator/emulator" \
             -avd CloudPhone \
             -no-snapshot \
             -no-boot-anim \
@@ -90,9 +102,9 @@ jobs:
           printf '[Desktop Entry]\nType=Application\nName=Android Emulator\nExec=%s/start-android.sh\nX-GNOME-Autostart-enabled=true\n' "$HOME" \
             > "$HOME/.config/autostart/android.desktop"
 
-      - name: Secure and Start RDP
+      # 8. Start RDP
+      - name: Start RDP Server
         run: |
-          # Allow RDP only through Tailscale
           sudo iptables -I INPUT 1 \
             ! -i tailscale0 \
             -p tcp --dport 3389 \
@@ -104,13 +116,39 @@ jobs:
           sleep 5
 
           if ! nc -z 127.0.0.1 3389; then
-            echo "RDP server failed to start"
+            echo "RDP server failed!"
             sudo systemctl status xrdp --no-pager
             exit 1
           fi
 
           echo "RDP server is running!"
 
+      # 9. Wait for Android Boot
+      - name: Start Android Emulator
+        run: |
+          nohup "$HOME/start-android.sh" \
+            > "$HOME/android.log" 2>&1 &
+
+          for i in $(seq 1 90); do
+            if adb devices | grep -q emulator; then
+              break
+            fi
+            sleep 5
+          done
+
+          adb wait-for-device
+
+          for i in $(seq 1 90); do
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+              echo "Android boot completed!"
+              break
+            fi
+            sleep 5
+          done
+
+          adb shell getprop ro.build.version.release
+
+      # 10. Print Connection Information
       - name: Print All Connection Details
         run: |
           IP=$(tailscale ip -4)
@@ -128,18 +166,19 @@ jobs:
           echo "================================"
 
           {
-            echo "## Android RDP Connection"
+            echo "## Android Cloud RDP"
             echo "- Address: $IP"
             echo "- Port: 3389"
             echo "- Username: $USER_NAME"
             echo "- Password: GitHub Secret RDP_PASSWORD"
             echo "- Android: 15 x86_64"
-            echo "- Desktop: XFCE"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 11. Keep Connection Alive
       - name: Keep Connection Alive
         run: |
           while true; do
             echo "Android RDP is running..."
+            echo "Time: $(date)"
             sleep 300
           done
