@@ -1,12 +1,31 @@
-android-cloud:
+name: Android RDP Cloud
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android-rdp:
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 360
 
     steps:
+      - name: Install Desktop and RDP Server
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-goodies \
+            xrdp \
+            xorgxrdp \
+            dbus-x11 \
+            x11-xserver-utils \
+            iptables \
+            netcat-openbsd
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Emulator
+      - name: Install Android 64-bit Emulator
         run: |
           sdkmanager --install \
             "platform-tools" \
@@ -17,79 +36,110 @@ android-cloud:
           echo "no" | avdmanager create avd \
             --force \
             --name CloudPhone \
-            --device pixel_7_pro \
             --package "system-images;android-35;google_apis;x86_64"
-
-      - name: Start Virtual Display
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11vnc
-          Xvfb :99 -screen 0 1280x800x24 &
-          sleep 3
-
-      - name: Start Android Emulator
-        run: |
-          export DISPLAY=:99
-
-          $ANDROID_HOME/emulator/emulator \
-            -avd CloudPhone \
-            -no-snapshot \
-            -no-audio \
-            -no-boot-anim \
-            -gpu swiftshader_indirect \
-            > /tmp/emulator.log 2>&1 &
-
-          adb wait-for-device
-
-          for i in $(seq 1 60); do
-            if adb shell getprop sys.boot_completed | grep -q 1; then
-              break
-            fi
-            sleep 5
-          done
-
-          adb devices
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
-      - name: Start VNC
+      - name: Configure RDP Account
         env:
-          VPASS: ${{ secrets.VNC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          mkdir -p ~/.vnc
-          x11vnc -storepasswd "$VPASS" ~/.vnc/passwd
-          x11vnc \
-            -display :99 \
-            -rfbauth ~/.vnc/passwd \
-            -rfbport 5900 \
-            -forever \
-            -shared \
-            -bg
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "RDP password must contain at least 12 characters"
+            exit 1
+          fi
+
+          USER_NAME=$(whoami)
+
+          echo "$USER_NAME:$RDP_PASSWORD" | sudo chpasswd
+
+          sudo usermod -aG ssl-cert "$USER_NAME"
+
+          mkdir -p "$HOME/.config/autostart"
+
+          cat > "$HOME/.xsession" <<'EOF'
+          #!/bin/sh
+          exec startxfce4
+          EOF
+
+          chmod +x "$HOME/.xsession"
+
+      - name: Configure Android Auto Start
+        run: |
+          mkdir -p "$HOME/.config/autostart"
+
+          cat > "$HOME/start-android.sh" <<EOF
+          #!/bin/bash
+          export ANDROID_HOME="$ANDROID_HOME"
+          export PATH="\$ANDROID_HOME/platform-tools:\$ANDROID_HOME/emulator:\$PATH"
+
+          "\$ANDROID_HOME/emulator/emulator" \
+            -avd CloudPhone \
+            -no-snapshot \
+            -no-boot-anim \
+            -no-audio \
+            -gpu swiftshader_indirect \
+            -accel off
+          EOF
+
+          chmod +x "$HOME/start-android.sh"
+
+          printf '[Desktop Entry]\nType=Application\nName=Android Emulator\nExec=%s/start-android.sh\nX-GNOME-Autostart-enabled=true\n' "$HOME" \
+            > "$HOME/.config/autostart/android.desktop"
+
+      - name: Secure and Start RDP
+        run: |
+          # Allow RDP only through Tailscale
+          sudo iptables -I INPUT 1 \
+            ! -i tailscale0 \
+            -p tcp --dport 3389 \
+            -j DROP
+
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
 
           sleep 5
 
-      - name: Print Connection Details
+          if ! nc -z 127.0.0.1 3389; then
+            echo "RDP server failed to start"
+            sudo systemctl status xrdp --no-pager
+            exit 1
+          fi
+
+          echo "RDP server is running!"
+
+      - name: Print All Connection Details
         run: |
-          echo "===== ANDROID CLOUD PHONE ====="
-          echo "Tailscale IPv4:"
-          tailscale ip -4
-          echo "VNC Port: 5900"
-          echo "VNC Password: GitHub Secret VNC_PASSWORD"
-          echo "VNC Username: Leave blank"
-          echo "Android:"
-          adb shell getprop ro.build.version.release
+          IP=$(tailscale ip -4)
+          USER_NAME=$(whoami)
+
+          echo "================================"
+          echo "       ANDROID CLOUD RDP"
+          echo "================================"
+          echo "Tailscale IPv4: $IP"
+          echo "Port: 3389"
+          echo "Username: $USER_NAME"
+          echo "Password: GitHub Secret RDP_PASSWORD"
+          echo "Android: Android 15 x86_64"
+          echo "Desktop: XFCE"
           echo "================================"
 
           {
-            echo "## Android Cloud Phone"
-            echo "- IP: $(tailscale ip -4)"
-            echo "- Port: 5900"
-            echo "- Password: GitHub Secret VNC_PASSWORD"
+            echo "## Android RDP Connection"
+            echo "- Address: $IP"
+            echo "- Port: 3389"
+            echo "- Username: $USER_NAME"
+            echo "- Password: GitHub Secret RDP_PASSWORD"
+            echo "- Android: 15 x86_64"
+            echo "- Desktop: XFCE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep Online
+      - name: Keep Connection Alive
         run: |
-          sleep 20700
+          while true; do
+            echo "Android RDP is running..."
+            sleep 300
+          done
