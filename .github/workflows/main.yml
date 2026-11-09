@@ -1,3 +1,4 @@
+
 name: Android Cloud RDP
 
 on:
@@ -16,68 +17,52 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 2. Android SDK - FIXED
+      # 2. Android SDK
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: 'platform-tools emulator'
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-
-      # 3. Install Android 15 system image
-      - name: Install Android 15
         run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+
+          yes | sdkmanager --licenses
+
           sdkmanager --install \
+            "platform-tools" \
             "platforms;android-35" \
+            "emulator" \
             "system-images;android-35;google_apis;x86_64"
 
-          sdkmanager --list_installed
-
-      # 4. Install XFCE and XRDP
-      - name: Install Remote Desktop
+      # 3. Desktop and RDP
+      - name: Install Desktop and RDP Server
         run: |
           sudo apt-get update
-
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xfce4 \
             xfce4-goodies \
             xrdp \
             xorgxrdp \
             dbus-x11 \
-            x11-xserver-utils \
+            x11vnc \
+            xvfb \
             netcat-openbsd
 
-      # 5. Create Android Virtual Device
-      - name: Create Android Phone
+      # 4. Create Android Emulator
+      - name: Create Android Emulator
         run: |
-          mkdir -p "$HOME/.android"
-
           echo "no" | avdmanager create avd \
             --force \
             --name CloudPhone \
-            --device pixel_2 \
+            --device pixel_7_pro \
             --package "system-images;android-35;google_apis;x86_64"
 
-          CONFIG="$HOME/.android/avd/CloudPhone.avd/config.ini"
-
-          cat >> "$CONFIG" <<'EOF'
-          hw.ramSize=4096
-          hw.cpu.ncore=4
-          hw.gpu.enabled=yes
-          hw.gpu.mode=swiftshader_indirect
-          vm.heapSize=512
-          EOF
-
-          echo "Android AVD created"
-
-      # 6. Connect Tailscale
+      # 5. Tailscale
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
-      # 7. Configure RDP account
-      - name: Configure RDP Account
+      # 6. Configure RDP User
+      - name: Configure RDP User
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -88,9 +73,10 @@ jobs:
 
           USER_NAME=$(whoami)
 
-          printf '%s:%s\n' "$USER_NAME" "$RDP_PASSWORD" | sudo chpasswd
-
+          echo "$USER_NAME:$RDP_PASSWORD" | sudo chpasswd
           sudo usermod -aG ssl-cert "$USER_NAME"
+
+          mkdir -p "$HOME/.config"
 
           cat > "$HOME/.xsession" <<'EOF'
           #!/bin/sh
@@ -99,43 +85,32 @@ jobs:
 
           chmod +x "$HOME/.xsession"
 
-      # 8. Create Android startup script
-      - name: Configure Android Startup
+      # 7. Start Android Emulator
+      - name: Start Android Emulator
         run: |
-          cat > "$HOME/start-android.sh" <<'EOF'
-          #!/bin/bash
-
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
-
-          LOG="$HOME/android-emulator.log"
-
-          echo "Starting Android Emulator..." >> "$LOG"
-
-          exec "$ANDROID_HOME/emulator/emulator" \
+          nohup "$ANDROID_HOME/emulator/emulator" \
             -avd CloudPhone \
             -no-snapshot \
             -no-boot-anim \
             -no-audio \
             -gpu swiftshader_indirect \
-            >> "$LOG" 2>&1
-          EOF
+            > "$HOME/android.log" 2>&1 &
 
-          chmod +x "$HOME/start-android.sh"
+          adb wait-for-device
 
-          mkdir -p "$HOME/.config/autostart"
+          for i in $(seq 1 90); do
+            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$BOOT" = "1" ]; then
+              echo "Android started successfully!"
+              break
+            fi
+            sleep 5
+          done
 
-          cat > "$HOME/.config/autostart/android.desktop" <<EOF
-          [Desktop Entry]
-          Type=Application
-          Name=Android Emulator
-          Exec=$HOME/start-android.sh
-          X-GNOME-Autostart-enabled=true
-          EOF
+          adb shell getprop ro.build.version.release
 
-      # 9. Start RDP service
-      - name: Start XRDP
+      # 8. Start RDP
+      - name: Start RDP Server
         run: |
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
@@ -143,60 +118,42 @@ jobs:
           sleep 5
 
           if ! nc -z 127.0.0.1 3389; then
-            echo "XRDP failed to start"
             sudo systemctl status xrdp --no-pager
             exit 1
           fi
 
-          echo "XRDP is listening on port 3389"
+          echo "RDP server is running!"
 
-      # 10. Protect RDP with Tailscale
-      - name: Secure RDP Access
-        run: |
-          sudo iptables -I INPUT 1 \
-            -i tailscale0 \
-            -p tcp --dport 3389 \
-            -j ACCEPT
-
-          sudo iptables -I INPUT 2 \
-            ! -i tailscale0 \
-            -p tcp --dport 3389 \
-            -j DROP
-
-          echo "RDP restricted to Tailscale"
-
-      # 11. Print all connection details
-      - name: Connection Information
+      # 9. Print Connection Details
+      - name: Print Connection Information
         run: |
           IP=$(tailscale ip -4)
           USER_NAME=$(whoami)
 
           echo "================================"
-          echo "       ANDROID CLOUD RDP"
+          echo "ANDROID CLOUD RDP"
           echo "================================"
-          echo "IP: $IP"
+          echo "Address: $IP"
           echo "Port: 3389"
           echo "Username: $USER_NAME"
           echo "Password: GitHub Secret RDP_PASSWORD"
-          echo "Android: 15 x86_64"
-          echo "RAM: 4096 MB (AVD setting)"
-          echo "CPU: 4 virtual cores (AVD setting)"
+          echo "Android: Android 15 x86_64"
           echo "================================"
 
           {
-            echo "## Android RDP"
+            echo "## Android RDP Connection"
             echo "- Address: $IP"
             echo "- Port: 3389"
             echo "- Username: $USER_NAME"
             echo "- Password: GitHub Secret RDP_PASSWORD"
-            echo "- Android: 15 x86_64"
+            echo "- Android: Android 15 x86_64"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 12. Keep runner alive
-      - name: Keep Online
+      # 10. Keep Alive
+      - name: Keep Connection Alive
         run: |
           while true; do
-            echo "Android RDP is running..."
+            echo "Android Cloud RDP is running"
             echo "Time: $(date)"
             sleep 300
           done
