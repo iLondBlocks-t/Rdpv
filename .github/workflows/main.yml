@@ -1,159 +1,113 @@
-
-name: Android Cloud RDP
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  android-rdp:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      # 1. Java 17
-      - name: Install Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      # 2. Android SDK
-      - name: Setup Android SDK
+      - name: Configure Core RDP Settings
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          yes | sdkmanager --licenses
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "emulator" \
-            "system-images;android-35;google_apis;x86_64"
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-      # 3. Desktop and RDP
-      - name: Install Desktop and RDP Server
+      - name: Create RDP User with Secure Password
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 \
-            xfce4-goodies \
-            xrdp \
-            xorgxrdp \
-            dbus-x11 \
-            x11vnc \
-            xvfb \
-            netcat-openbsd
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-      # 4. Create Android Emulator
-      - name: Create Android Emulator
+      - name: Install Tailscale
         run: |
-          echo "no" | avdmanager create avd \
-            --force \
-            --name CloudPhone \
-            --device pixel_7_pro \
-            --package "system-images;android-35;google_apis;x86_64"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      # 5. Tailscale
-      - name: Connect Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-
-      # 6. Configure RDP User
-      - name: Configure RDP User
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Establish Tailscale Connection
         run: |
-          if [ -z "$RDP_PASSWORD" ] || [ "${#RDP_PASSWORD}" -lt 12 ]; then
-            echo "RDP_PASSWORD must be at least 12 characters"
-            exit 1
-          fi
-
-          USER_NAME=$(whoami)
-
-          echo "$USER_NAME:$RDP_PASSWORD" | sudo chpasswd
-          sudo usermod -aG ssl-cert "$USER_NAME"
-
-          mkdir -p "$HOME/.config"
-
-          cat > "$HOME/.xsession" <<'EOF'
-          #!/bin/sh
-          exec startxfce4
-          EOF
-
-          chmod +x "$HOME/.xsession"
-
-      # 7. Start Android Emulator
-      - name: Start Android Emulator
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
-          nohup "$ANDROID_HOME/emulator/emulator" \
-            -avd CloudPhone \
-            -no-snapshot \
-            -no-boot-anim \
-            -no-audio \
-            -gpu swiftshader_indirect \
-            > "$HOME/android.log" 2>&1 &
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-          adb wait-for-device
-
-          for i in $(seq 1 90); do
-            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            if [ "$BOOT" = "1" ]; then
-              echo "Android started successfully!"
-              break
-            fi
-            sleep 5
-          done
-
-          adb shell getprop ro.build.version.release
-
-      # 8. Start RDP
-      - name: Start RDP Server
+      - name: Maintain Connection
         run: |
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-
-          sleep 5
-
-          if ! nc -z 127.0.0.1 3389; then
-            sudo systemctl status xrdp --no-pager
-            exit 1
-          fi
-
-          echo "RDP server is running!"
-
-      # 9. Print Connection Details
-      - name: Print Connection Information
-        run: |
-          IP=$(tailscale ip -4)
-          USER_NAME=$(whoami)
-
-          echo "================================"
-          echo "ANDROID CLOUD RDP"
-          echo "================================"
-          echo "Address: $IP"
-          echo "Port: 3389"
-          echo "Username: $USER_NAME"
-          echo "Password: GitHub Secret RDP_PASSWORD"
-          echo "Android: Android 15 x86_64"
-          echo "================================"
-
-          {
-            echo "## Android RDP Connection"
-            echo "- Address: $IP"
-            echo "- Port: 3389"
-            echo "- Username: $USER_NAME"
-            echo "- Password: GitHub Secret RDP_PASSWORD"
-            echo "- Android: Android 15 x86_64"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # 10. Keep Alive
-      - name: Keep Connection Alive
-        run: |
-          while true; do
-            echo "Android Cloud RDP is running"
-            echo "Time: $(date)"
-            sleep 300
-          done
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
