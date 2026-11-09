@@ -1,52 +1,95 @@
-
-name: macOS-Tailscale
-
-on:
-  workflow_dispatch:
-
-jobs:
-  macos:
-    runs-on: macos-latest
-    timeout-minutes: 360
+android-cloud:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
 
     steps:
-      - name: Install Tailscale
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Emulator
         run: |
-          brew install tailscale
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "emulator" \
+            "system-images;android-35;google_apis;x86_64"
+
+          echo "no" | avdmanager create avd \
+            --force \
+            --name CloudPhone \
+            --device pixel_7_pro \
+            --package "system-images;android-35;google_apis;x86_64"
+
+      - name: Start Virtual Display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11vnc
+          Xvfb :99 -screen 0 1280x800x24 &
+          sleep 3
+
+      - name: Start Android Emulator
+        run: |
+          export DISPLAY=:99
+
+          $ANDROID_HOME/emulator/emulator \
+            -avd CloudPhone \
+            -no-snapshot \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            > /tmp/emulator.log 2>&1 &
+
+          adb wait-for-device
+
+          for i in $(seq 1 60); do
+            if adb shell getprop sys.boot_completed | grep -q 1; then
+              break
+            fi
+            sleep 5
+          done
+
+          adb devices
 
       - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+      - name: Start VNC
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          VPASS: ${{ secrets.VNC_PASSWORD }}
         run: |
-          sudo brew services start tailscale
+          mkdir -p ~/.vnc
+          x11vnc -storepasswd "$VPASS" ~/.vnc/passwd
+          x11vnc \
+            -display :99 \
+            -rfbauth ~/.vnc/passwd \
+            -rfbport 5900 \
+            -forever \
+            -shared \
+            -bg
 
-          sudo tailscale up \
-            --authkey="$TS_AUTHKEY" \
-            --hostname="github-macos-${GITHUB_RUN_ID}"
+          sleep 5
 
+      - name: Print Connection Details
+        run: |
+          echo "===== ANDROID CLOUD PHONE ====="
+          echo "Tailscale IPv4:"
           tailscale ip -4
+          echo "VNC Port: 5900"
+          echo "VNC Password: GitHub Secret VNC_PASSWORD"
+          echo "VNC Username: Leave blank"
+          echo "Android:"
+          adb shell getprop ro.build.version.release
+          echo "================================"
 
-      - name: Install Blender
+          {
+            echo "## Android Cloud Phone"
+            echo "- IP: $(tailscale ip -4)"
+            echo "- Port: 5900"
+            echo "- Password: GitHub Secret VNC_PASSWORD"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep Online
         run: |
-          brew install --cask blender
-
-          /Applications/Blender.app/Contents/MacOS/Blender \
-            --version
-
-      - name: System Information
-        run: |
-          echo "=== macOS ==="
-          sw_vers
-
-          echo "=== CPU ==="
-          sysctl -n machdep.cpu.brand_string
-
-          echo "=== GPU ==="
-          system_profiler SPDisplaysDataType
-
-      - name: Keep Alive
-        run: |
-          while true; do
-            echo "macOS runner active: $(date)"
-            sleep 300
-          done
+          sleep 20700
