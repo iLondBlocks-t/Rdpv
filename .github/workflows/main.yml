@@ -1,4 +1,4 @@
-name: Windows RDP via Tailscale
+name: macOS SSH
 
 on:
   workflow_dispatch:
@@ -6,71 +6,31 @@ on:
 permissions: {}
 
 jobs:
-  windows-rdp:
-    runs-on: windows-latest
+  macos-ssh:
+    runs-on: macos-latest
     timeout-minutes: 360
 
     steps:
-      - name: Verify RDP password secret is configured
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Missing repository Actions secret RDP_PASSWORD. Add it before starting this workflow."
-          }
-          if ($env:RDP_PASSWORD.Length -lt 16) {
-            throw 'RDP_PASSWORD must be at least 16 characters.'
-          }
-
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TALESCALE_AUTH_KEY }}
           log-mode: quiet
 
-      - name: Configure secure RDP access
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Enable Tailscale SSH
+        shell: bash
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Missing repository Actions secret RDP_PASSWORD. Add it before starting this workflow."
-          }
-
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $rdpUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
-          if ($rdpUser) {
-            Set-LocalUser -Name "RDP" -Password $securePassword
-          } else {
-            New-LocalUser -Name "RDP" -Password $securePassword -FullName "RDP User" -Description "Temporary Tailscale-only RDP account" -AccountNeverExpires | Out-Null
-          }
-
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          $rdpTcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-          Set-ItemProperty -Path $rdpPath -Name 'fDenyTSConnections' -Value 0 -Force
-          Set-ItemProperty -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1 -Force
-          Set-ItemProperty -Path $rdpTcpPath -Name 'SecurityLayer' -Value 2 -Force
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
-
-          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
-          New-NetFirewallRule -DisplayName 'RDP over Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
-
-          $tailscaleIp = (tailscale ip -4 | Select-Object -First 1).Trim()
-          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
-            throw 'Tailscale did not provide an IPv4 address.'
-          }
-          Write-Output "RDP address (Tailscale only): $tailscaleIp"
-          Write-Output 'RDP username: .\RDP'
-          Write-Output 'Use the password stored in the repository secret RDP_PASSWORD.'
+          sudo tailscale set --ssh
+          runner_user="$(whoami)"
+          runner_ip="$(tailscale ip -4)"
+          echo "Runner user: ${runner_user}"
+          echo "Tailscale IPv4: ${runner_ip}"
+          echo "Connect with: tailscale ssh ${runner_user}@${runner_ip}"
 
       - name: Keep runner available
-        shell: pwsh
+        shell: bash
         run: |
-          Write-Output 'The Windows runner stays available until cancelled or the 6-hour job limit is reached.'
-          while ($true) {
-            Start-Sleep -Seconds 300
-          }
+          echo "The macOS runner will stay available until cancelled or the 6-hour job limit is reached."
+          while true; do
+            sleep 300
+          done
